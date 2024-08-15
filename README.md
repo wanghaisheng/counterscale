@@ -1,4 +1,4 @@
-# Counterscale
+# TiktokaStudio Analytics toolkit on cloudlfare
 
 ![](/public/counterscale-logo-300x300.webp)
 
