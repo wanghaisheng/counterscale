@@ -1,3 +1,4 @@
+/// <reference types="vite/client" />
 import styles from "./globals.css?url";
 import {
     json,
@@ -6,15 +7,12 @@ import {
 } from "@remix-run/cloudflare";
 
 import {
-    isRouteErrorResponse,
     Links,
     Meta,
     Outlet,
     Scripts,
     ScrollRestoration,
     useLoaderData,
-    useRouteError,
-    useRouteLoaderData,
 } from "@remix-run/react";
 
 export const links: LinksFunction = () => [{ rel: "stylesheet", href: styles }];
@@ -22,19 +20,18 @@ export const links: LinksFunction = () => [{ rel: "stylesheet", href: styles }];
 export const loader = ({ context, request }: LoaderFunctionArgs) => {
     const url = new URL(request.url);
     return json({
-        version: context.cloudflare.env.CF_PAGES_COMMIT_SHA,
+        version: context.cloudflare?.env?.CF_PAGES_COMMIT_SHA,
         origin: url.origin,
         url: request.url,
     });
 };
 
 export const Layout = ({ children = [] }: { children: React.ReactNode }) => {
-    const data = useRouteLoaderData<typeof loader>("root") ?? {
+    const data = useLoaderData<typeof loader>() ?? {
         version: "unknown",
         origin: "counterscale.dev",
         url: "https://counterscale.dev/",
     };
-    // const error = useRouteError();
 
     return (
         <html lang="en">
@@ -90,6 +87,7 @@ export const Layout = ({ children = [] }: { children: React.ReactNode }) => {
 
 export default function App() {
     const data = useLoaderData<typeof loader>();
+
     return (
         <div className="mt-4">
             <header className="border-b-2 mb-8 py-2">
@@ -145,25 +143,3 @@ export default function App() {
         </div>
     );
 }
-
-export const ErrorBoundary = () => {
-    const error = useRouteError();
-
-    if (isRouteErrorResponse(error)) {
-        return (
-            <>
-                <h1>
-                    {error.status} {error.statusText}
-                </h1>
-                <p>{error.data}</p>
-            </>
-        );
-    }
-
-    return (
-        <>
-            <h1>Error!</h1>
-            <p>{(error as { message?: string })?.message ?? "Unknown error"}</p>
-        </>
-    );
-};

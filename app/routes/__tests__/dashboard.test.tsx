@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { json } from "@remix-run/node";
+import { json, LoaderFunctionArgs } from "@remix-run/node";
 import {
     vi,
     test,
@@ -36,29 +36,57 @@ describe("Dashboard route", () => {
     });
 
     describe("loader", () => {
-        test("throws an exception if no Cloudflare credentials are provided", async () => {
-            // empty strings
-            await expect(
-                loader({
-                    context: {
-                        analyticsEngine: new AnalyticsEngineAPI(
-                            "testAccountId",
-                            "testApiToken",
-                        ),
-                        cloudflare: {
-                            // @ts-expect-error we don't need to provide all the properties of the cloudflare object
-                            env: {
-                                CF_BEARER_TOKEN: "",
-                                CF_ACCOUNT_ID: "",
-                            },
+        test("throws a 501 Response if no Cloudflare credentials are provided", async () => {
+            const mockLoaderParams: LoaderFunctionArgs = {
+                context: {
+                    analyticsEngine: new AnalyticsEngineAPI(
+                        "testAccountId",
+                        "testApiToken",
+                    ),
+                    cloudflare: {
+                        // @ts-expect-error we don't need to provide all the properties of the cloudflare object
+                        env: {
+                            CF_ACCOUNT_ID: "",
+                            CF_BEARER_TOKEN: "",
                         },
                     },
-                    // @ts-expect-error we don't need to provide all the properties of the request object
-                    request: {
-                        url: "http://localhost:3000/dashboard",
-                    },
-                }),
-            ).rejects.toThrow("Missing Cloudflare credentials");
+                },
+                // @ts-expect-error we don't need to provide all the properties of the request object
+                request: {
+                    url: "http://localhost:3000/dashboard",
+                },
+            };
+
+            try {
+                await loader(mockLoaderParams);
+            } catch (error) {
+                expect(error).toBeInstanceOf(Response);
+                const response = error as Response;
+                expect(await response.text()).toBe(
+                    "Missing credentials: CF_ACCOUNT_ID is not set.",
+                );
+                expect(response.status).toBe(501);
+            }
+
+            // run it again, this time with account ID present, but bearer token absent
+            mockLoaderParams.context.cloudflare = {
+                // @ts-expect-error we don't need to provide all the properties of the cloudflare object
+                env: {
+                    CF_ACCOUNT_ID: "testAccountId",
+                    CF_BEARER_TOKEN: "",
+                },
+            };
+
+            try {
+                await loader(mockLoaderParams);
+            } catch (error) {
+                expect(error).toBeInstanceOf(Response);
+                const response = error as Response;
+                expect(await response.text()).toBe(
+                    "Missing credentials: CF_BEARER_TOKEN is not set.",
+                );
+                expect(response.status).toBe(501);
+            }
         });
 
         test("redirects to ?site=siteId if no siteId is provided via query string", async () => {
@@ -115,24 +143,6 @@ describe("Dashboard route", () => {
                 }),
             );
 
-            // response for get counts
-            fetch.mockResolvedValueOnce(
-                createFetchResponse({
-                    data: [
-                        { isVisit: 1, isVisitor: 1, count: 1 },
-                        { isVisit: 1, isVisitor: 0, count: 2 },
-                        { isVisit: 0, isVisitor: 0, count: 3 },
-                    ],
-                }),
-            );
-
-            // response for getViewsGroupedByInterval
-            fetch.mockResolvedValueOnce(
-                createFetchResponse({
-                    data: [{ bucket: "2024-01-11 05:00:00", count: 4 }],
-                }),
-            );
-
             vi.setSystemTime(new Date("2024-01-18T09:33:02").getTime());
 
             const response = await loader({
@@ -149,19 +159,6 @@ describe("Dashboard route", () => {
                 filters: {},
                 siteId: "test-siteid",
                 sites: ["test-siteid"],
-                views: 6,
-                visits: 3,
-                visitors: 1,
-                viewsGroupedByInterval: [
-                    ["2024-01-11 05:00:00", 4],
-                    ["2024-01-12 05:00:00", 0],
-                    ["2024-01-13 05:00:00", 0],
-                    ["2024-01-14 05:00:00", 0],
-                    ["2024-01-15 05:00:00", 0],
-                    ["2024-01-16 05:00:00", 0],
-                    ["2024-01-17 05:00:00", 0],
-                    ["2024-01-18 05:00:00", 0],
-                ],
                 intervalType: "DAY",
                 interval: "7d",
             });
@@ -188,19 +185,6 @@ describe("Dashboard route", () => {
                 filters: {},
                 siteId: "",
                 sites: [],
-                views: 0,
-                visits: 0,
-                visitors: 0,
-                viewsGroupedByInterval: [
-                    ["2024-01-11 05:00:00", 0],
-                    ["2024-01-12 05:00:00", 0],
-                    ["2024-01-13 05:00:00", 0],
-                    ["2024-01-14 05:00:00", 0],
-                    ["2024-01-15 05:00:00", 0],
-                    ["2024-01-16 05:00:00", 0],
-                    ["2024-01-17 05:00:00", 0],
-                    ["2024-01-18 05:00:00", 0],
-                ],
                 intervalType: "DAY",
                 interval: "7d",
             });
@@ -212,10 +196,6 @@ describe("Dashboard route", () => {
             return json({
                 siteId: "@unknown",
                 sites: [],
-                views: [],
-                visits: [],
-                visitors: [],
-                viewsGroupedByInterval: [],
                 intervalType: "day",
             });
         }
@@ -226,6 +206,22 @@ describe("Dashboard route", () => {
                 Component: Dashboard,
                 loader,
                 children: [
+                    {
+                        path: "/resources/timeseries",
+                        loader: () => {
+                            return json({ chartData: [] });
+                        },
+                    },
+                    {
+                        path: "/resources/stats",
+                        loader: () => {
+                            return json({
+                                views: 0,
+                                visits: 0,
+                                visitors: 0,
+                            });
+                        },
+                    },
                     {
                         path: "/resources/paths",
                         loader: () => {
@@ -303,6 +299,22 @@ describe("Dashboard route", () => {
                 Component: Dashboard,
                 loader,
                 children: [
+                    {
+                        path: "/resources/stats",
+                        loader: () => {
+                            return json({
+                                views: 2133,
+                                visits: 80,
+                                visitors: 33,
+                            });
+                        },
+                    },
+                    {
+                        path: "/resources/timeseries",
+                        loader: () => {
+                            return json({});
+                        },
+                    },
                     {
                         path: "/resources/paths",
                         loader: () => {

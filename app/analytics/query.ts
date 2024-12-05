@@ -2,7 +2,7 @@ import { ColumnMappingToType, ColumnMappings } from "./schema";
 
 import { SearchFilters } from "~/lib/types";
 
-import dayjs, { ManipulateType } from "dayjs";
+import dayjs from "dayjs";
 import utc from "dayjs/plugin/utc";
 import timezone from "dayjs/plugin/timezone";
 
@@ -45,22 +45,30 @@ function accumulateCountsFromRowResult(
 }
 
 export function intervalToSql(interval: string, tz?: string) {
-    let intervalSql = "";
+    let startIntervalSql = "";
+    let endIntervalSql = "";
     switch (interval) {
         case "today":
             // example: toDateTime('2024-01-07 00:00:00', 'America/New_York')
-            intervalSql = `toDateTime('${dayjs().tz(tz).startOf("day").utc().format("YYYY-MM-DD HH:mm:ss")}')`;
+            startIntervalSql = `toDateTime('${dayjs().tz(tz).startOf("day").utc().format("YYYY-MM-DD HH:mm:ss")}')`;
+            endIntervalSql = "NOW()";
+            break;
+        case "yesterday":
+            startIntervalSql = `toDateTime('${dayjs().tz(tz).startOf("day").utc().subtract(1, "day").format("YYYY-MM-DD HH:mm:ss")}')`;
+            endIntervalSql = `toDateTime('${dayjs().tz(tz).startOf("day").utc().format("YYYY-MM-DD HH:mm:ss")}')`;
             break;
         case "1d":
         case "7d":
         case "30d":
         case "90d":
-            intervalSql = `NOW() - INTERVAL '${interval.split("d")[0]}' DAY`;
+            startIntervalSql = `NOW() - INTERVAL '${interval.split("d")[0]}' DAY`;
+            endIntervalSql = "NOW()";
             break;
         default:
-            intervalSql = `NOW() - INTERVAL '1' DAY`;
+            startIntervalSql = `NOW() - INTERVAL '1' DAY`;
+            endIntervalSql = "NOW()";
     }
-    return intervalSql;
+    return { startIntervalSql, endIntervalSql };
 }
 
 /**
@@ -77,6 +85,7 @@ export function intervalToSql(interval: string, tz?: string) {
 function generateEmptyRowsOverInterval(
     intervalType: "DAY" | "HOUR",
     startDateTime: Date,
+    endDateTime: Date,
     tz?: string,
 ): { [key: string]: number } {
     if (!tz) {
@@ -85,26 +94,28 @@ function generateEmptyRowsOverInterval(
 
     const initialRows: { [key: string]: number } = {};
 
-    // NOTE: Need to explicitly use dayjs to increment by 1 day/1 hour/etc, because
-    //       dayjs will respect and adjust for daylight savings time boundaries.
-    //
-    //       For example, in 2024, Daylight Savings Time began on 3/10/24 at 2:00 AM.
-    //       In UTC, before the switch, America/New_York was 5 hours behind UTC (+5:00).
-    //       But after the switch, it becomes 4 hours behind UTC (+4:00). Dayjs
-    //       accounts for this difference.
-    //
-    //       There is no unit test affirming this behavior, because I could not figure
-    //       out how to get vitest/mock dates to recreate DST changes.
-    //       See: https://github.com/benvinegar/counterscale/pull/62
-
-    while (startDateTime.getTime() < Date.now()) {
+    while (startDateTime.getTime() < endDateTime.getTime()) {
         const key = dayjs(startDateTime).utc().format("YYYY-MM-DD HH:mm:ss");
         initialRows[key] = 0;
 
-        startDateTime = dayjs(startDateTime)
-            // increment by either DAY or HOUR
-            .add(1, intervalType.toLowerCase() as ManipulateType)
-            .toDate();
+        if (intervalType === "DAY") {
+            // WARNING: Daylight savings hack. Cloudflare Workers uses a different Date
+            //          implementation than Node 20.x, which doesn't seem to respect DST
+            //          boundaries the same way(see: https://github.com/benvinegar/counterscale/issues/108).
+            //
+            //          To work around this, we add 25 hours to the start date/time, then get the
+            //          start of the day, then convert it back to a Date object. This works in both
+            //          Node 20.x and Cloudflare Workers environments.
+            startDateTime = dayjs(startDateTime)
+                .add(25, "hours")
+                .tz(tz)
+                .startOf("day")
+                .toDate();
+        } else if (intervalType === "HOUR") {
+            startDateTime = dayjs(startDateTime).add(1, "hour").toDate();
+        } else {
+            throw new Error("Invalid interval type");
+        }
     }
 
     return initialRows;
@@ -173,6 +184,7 @@ export class AnalyticsEngineAPI {
         siteId: string,
         intervalType: "DAY" | "HOUR",
         startDateTime: Date, // start date/time in local timezone
+        endDateTime: Date, // end date/time in local timezone
         tz?: string, // local timezone
         filters: SearchFilters = {},
     ) {
@@ -190,6 +202,7 @@ export class AnalyticsEngineAPI {
         const initialRows = generateEmptyRowsOverInterval(
             intervalType,
             startDateTime,
+            endDateTime,
             tz,
         );
 
@@ -206,6 +219,7 @@ export class AnalyticsEngineAPI {
         //         and merge them with the results.
 
         const localStartTime = dayjs(startDateTime).tz(tz).utc();
+        const localEndTime = dayjs(endDateTime).tz(tz).utc();
 
         const query = `
             SELECT SUM(_sample_interval) as count,
@@ -215,9 +229,9 @@ export class AnalyticsEngineAPI {
 
             /* output as UTC */
             toDateTime(_bucket, 'Etc/UTC') as bucket
-
             FROM metricsDataset
-            WHERE timestamp > toDateTime('${localStartTime.format("YYYY-MM-DD HH:mm:ss")}')
+            WHERE timestamp >= toDateTime('${localStartTime.format("YYYY-MM-DD HH:mm:ss")}') 
+								AND timestamp < toDateTime('${localEndTime.format("YYYY-MM-DD HH:mm:ss")}')
                 AND ${ColumnMappings.siteId} = '${siteId}'
                 ${filterStr}
             GROUP BY _bucket
@@ -279,7 +293,10 @@ export class AnalyticsEngineAPI {
         // defaults to 1 day if not specified
         const siteIdColumn = ColumnMappings["siteId"];
 
-        const intervalSql = intervalToSql(interval, tz);
+        const { startIntervalSql, endIntervalSql } = intervalToSql(
+            interval,
+            tz,
+        );
 
         const filterStr = filtersToSql(filters);
 
@@ -288,7 +305,7 @@ export class AnalyticsEngineAPI {
                 ${ColumnMappings.newVisitor} as isVisitor,
                 ${ColumnMappings.newSession} as isVisit
             FROM metricsDataset
-            WHERE timestamp > ${intervalSql}
+            WHERE timestamp >= ${startIntervalSql} AND timestamp < ${endIntervalSql}
                 ${filterStr}
             AND ${siteIdColumn} = '${siteId}'
             GROUP BY isVisitor, isVisit
@@ -341,7 +358,10 @@ export class AnalyticsEngineAPI {
         page: number = 1,
         limit: number = 10,
     ) {
-        const intervalSql = intervalToSql(interval, tz);
+        const { startIntervalSql, endIntervalSql } = intervalToSql(
+            interval,
+            tz,
+        );
 
         const filterStr = filtersToSql(filters);
 
@@ -349,7 +369,7 @@ export class AnalyticsEngineAPI {
         const query = `
             SELECT ${_column}, SUM(_sample_interval) as count
             FROM metricsDataset
-            WHERE timestamp > ${intervalSql}
+            WHERE timestamp >= ${startIntervalSql} AND timestamp < ${endIntervalSql}
                 AND ${ColumnMappings.newVisitor} = 1
                 AND ${ColumnMappings.siteId} = '${siteId}'
                 ${filterStr}
@@ -405,7 +425,10 @@ export class AnalyticsEngineAPI {
         page: number = 1,
         limit: number = 10,
     ): Promise<Record<string, AnalyticsCountResult>> {
-        const intervalSql = intervalToSql(interval, tz);
+        const { startIntervalSql, endIntervalSql } = intervalToSql(
+            interval,
+            tz,
+        );
 
         const filterStr = filtersToSql(filters);
 
@@ -416,7 +439,7 @@ export class AnalyticsEngineAPI {
                 ${ColumnMappings.newSession} as isVisit,
                 SUM(_sample_interval) as count
             FROM metricsDataset
-            WHERE timestamp > ${intervalSql}
+            WHERE timestamp >= ${startIntervalSql} AND timestamp < ${endIntervalSql}
                 AND ${ColumnMappings.siteId} = '${siteId}'
                 ${filterStr}
             GROUP BY ${_column}, ${ColumnMappings.newVisitor}, ${ColumnMappings.newSession}
@@ -579,18 +602,18 @@ export class AnalyticsEngineAPI {
         );
     }
 
-    async getSitesOrderedByHits(interval: string, tz?: string, limit?: number) {
+    async getSitesOrderedByHits(interval: string, limit?: number) {
         // defaults to 1 day if not specified
 
         limit = limit || 10;
 
-        const intervalSql = intervalToSql(interval, tz);
+        const { startIntervalSql, endIntervalSql } = intervalToSql(interval);
 
         const query = `
             SELECT SUM(_sample_interval) as count,
                 ${ColumnMappings.siteId} as siteId
             FROM metricsDataset
-            WHERE timestamp > ${intervalSql}
+            WHERE timestamp >= ${startIntervalSql} AND timestamp < ${endIntervalSql}
             GROUP BY siteId
             ORDER BY count DESC
             LIMIT ${limit}
